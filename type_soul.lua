@@ -8,7 +8,7 @@ getgenv().luaguardvars = {
     DiscordName = "cashfears",
 }
 
-local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/bothimee/testsoul/main/source"))()
+local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/bothimee/testsoul/main/source.lua"))()
 library:init()
 
 local Window = library.NewWindow({
