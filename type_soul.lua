@@ -28,6 +28,7 @@ local TweenService = game:GetService("TweenService")
 local TeleportService = game:GetService("TeleportService")
 local StarterGui = game:GetService("StarterGui")
 local CoreGui = game:GetService("CoreGui")
+local Stats = game:GetService("Stats")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -78,10 +79,18 @@ local Hub = {
 
         AutoParry = false,
         AutoParryRange = 18,
-        AutoParryReactionDelay = 0.04,
-        AutoParryCooldown = 0.35,
+        AutoParryReactionDelay = 0.02,
+        AutoParryCooldown = 0.65,
         AutoParryAnimationWindow = 0.55,
         AutoParryFacingDot = 0.25,
+        AutoParryM1Delay = 0.14,
+        AutoParryHeavyDelay = 0.24,
+        AutoParrySkillDelay = 0.42,
+        AutoParryGenericDelay = 0.28,
+        AutoParryPingCompensation = 0.45,
+        AutoParryMissLockout = 0.85,
+        AutoParryThreatReset = 0.9,
+        AutoParrySkillAssist = true,
 
         MovementEnabled = false,
         MovementMode = "Hybrid",
@@ -105,6 +114,8 @@ local Hub = {
         LastMovementState = "none",
         KnownAttackTracks = {},
         PendingParry = false,
+        ThreatMemory = {},
+        LastDebugMovementState = nil,
     },
 }
 
@@ -153,22 +164,7 @@ local movementBlockedStates = {
     Action = true,
 }
 
-local attackAnimationKeywords = {
-    "attack",
-    "swing",
-    "slash",
-    "m1",
-    "m2",
-    "crit",
-    "critical",
-    "heavy",
-    "punch",
-    "kick",
-    "uppercut",
-    "skill",
-    "combo",
-    "aerial",
-}
+local CustomSkillProfiles = getgenv().CatboyHubTypeSoulSkillProfiles or {}
 
 local function notify(title, text, duration)
     pcall(function()
@@ -967,9 +963,115 @@ local function isFacingMe(enemyRootPart, myRootPart)
     return enemyRootPart.CFrame.LookVector:Dot(toMe.Unit) >= Hub.Flags.AutoParryFacingDot
 end
 
+local function getPingSeconds()
+    local ok, ping = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+
+    if not ok or type(ping) ~= "number" then
+        return 0
+    end
+
+    return clamp(ping / 1000, 0, 0.35)
+end
+
+local function classifyText(text)
+    text = string.lower(tostring(text or ""))
+
+    if text == "" or text == "none" then
+        return nil
+    end
+
+    if string.find(text, "bankai", 1, true)
+        or string.find(text, "shikai", 1, true)
+        or string.find(text, "skill", 1, true)
+        or string.find(text, "kido", 1, true)
+        or string.find(text, "hakuda", 1, true)
+        or string.find(text, "ability", 1, true)
+    then
+        return "skill"
+    end
+
+    if string.find(text, "crit", 1, true)
+        or string.find(text, "critical", 1, true)
+        or string.find(text, "heavy", 1, true)
+        or string.find(text, "m2", 1, true)
+    then
+        return "heavy"
+    end
+
+    if string.find(text, "m1", 1, true)
+        or string.find(text, "attack", 1, true)
+        or string.find(text, "swing", 1, true)
+        or string.find(text, "slash", 1, true)
+        or string.find(text, "punch", 1, true)
+        or string.find(text, "kick", 1, true)
+        or string.find(text, "combo", 1, true)
+        or string.find(text, "aerial", 1, true)
+    then
+        return "m1"
+    end
+
+    if text == "action" or text == "attacking" then
+        return "generic"
+    end
+
+    return nil
+end
+
+local function delayForThreatKind(kind)
+    if kind == "skill" then
+        return Hub.Flags.AutoParrySkillDelay
+    elseif kind == "heavy" then
+        return Hub.Flags.AutoParryHeavyDelay
+    elseif kind == "m1" then
+        return Hub.Flags.AutoParryM1Delay
+    end
+
+    return Hub.Flags.AutoParryGenericDelay
+end
+
+local function adjustedDelay(kind)
+    local baseDelay = delayForThreatKind(kind)
+    if kind == "skill" and not Hub.Flags.AutoParrySkillAssist then
+        baseDelay = Hub.Flags.AutoParryGenericDelay
+    end
+
+    local pingOffset = math.min(getPingSeconds() * Hub.Flags.AutoParryPingCompensation, 0.14)
+    return clamp(baseDelay + Hub.Flags.AutoParryReactionDelay - pingOffset, 0.03, 1.25)
+end
+
+local function makeThreat(kind, signature, reason)
+    return {
+        Kind = kind or "generic",
+        Signature = tostring(signature or reason or "unknown"),
+        Reason = tostring(reason or kind or "unknown"),
+    }
+end
+
+local function getCustomProfile(threat)
+    if not threat then
+        return nil
+    end
+
+    return CustomSkillProfiles[threat.Signature]
+        or CustomSkillProfiles[threat.Reason]
+        or CustomSkillProfiles[threat.Kind]
+end
+
+local function delayForThreat(threat)
+    local profile = getCustomProfile(threat)
+    if profile and type(profile.Delay) == "number" then
+        local pingOffset = math.min(getPingSeconds() * Hub.Flags.AutoParryPingCompensation, 0.14)
+        return clamp(profile.Delay + Hub.Flags.AutoParryReactionDelay - pingOffset, 0.03, 1.25)
+    end
+
+    return adjustedDelay(profile and profile.Kind or threat.Kind)
+end
+
 local function trackLooksHostile(track)
     if not track or not track.IsPlaying then
-        return false
+        return nil
     end
 
     local name = string.lower(track.Name or "")
@@ -979,47 +1081,52 @@ local function trackLooksHostile(track)
         id = string.lower(track.Animation and track.Animation.AnimationId or "")
     end)
 
-    for _, keyword in ipairs(attackAnimationKeywords) do
-        if string.find(name, keyword, 1, true) or string.find(id, keyword, 1, true) then
-            return true, id ~= "" and id or name
-        end
+    local textKind = classifyText(name) or classifyText(id)
+    if textKind then
+        local signature = id ~= "" and id or name
+        return makeThreat(textKind, "anim:" .. signature, signature)
     end
 
     if string.find(tostring(track.Priority), "Action", 1, true) then
         local timePosition = tonumber(track.TimePosition) or 0
         local length = tonumber(track.Length) or 0
-        if timePosition <= Hub.Flags.AutoParryAnimationWindow and length > 0.15 then
-            return true, id ~= "" and id or ("priority:" .. tostring(track.Priority))
+        if timePosition <= Hub.Flags.AutoParryAnimationWindow and length > 0.18 then
+            local signature = id ~= "" and id or (track.Name ~= "" and track.Name or tostring(track.Priority))
+            local kind = length >= 0.55 and "skill" or "generic"
+            return makeThreat(kind, "priority:" .. signature, signature)
         end
     end
 
-    return false, nil
+    return nil
 end
 
 local function isEnemyAttacking(character, entity)
     local state = readState(entity)
-    if attackStates[state] then
-        return true, "state:" .. state
+    local stateKind = classifyText(state)
+    if stateKind then
+        return makeThreat(stateKind, "state:" .. state, "state:" .. state)
+    elseif attackStates[state] then
+        return makeThreat("generic", "state:" .. state, "state:" .. state)
     end
 
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
     local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
     if not animator then
-        return false, nil
+        return nil
     end
 
     for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        local hostile, reason = trackLooksHostile(track)
-        if hostile then
-            if reason and not Hub.Runtime.KnownAttackTracks[reason] then
-                Hub.Runtime.KnownAttackTracks[reason] = true
-                debugPrint("detected hostile animation", reason)
+        local threat = trackLooksHostile(track)
+        if threat then
+            if threat.Signature and not Hub.Runtime.KnownAttackTracks[threat.Signature] then
+                Hub.Runtime.KnownAttackTracks[threat.Signature] = true
+                debugPrint("detected hostile animation", threat.Signature, "kind", threat.Kind)
             end
-            return true, reason or "animation"
+            return threat
         end
     end
 
-    return false, nil
+    return nil
 end
 
 local function canAct()
@@ -1055,34 +1162,121 @@ local function pressKey(keyCode, duration)
     end
 end
 
-local function fireParry(reason, targetName, distance)
-    if Hub.Runtime.PendingParry then
-        return
+local function validateThreat(targetName, memory)
+    local _, _, myRootPart = getCharacterParts(LocalPlayer)
+    if not myRootPart then
+        return false
     end
 
+    local entities = getEntitiesFolder()
+    local enemyEntity = entities and entities:FindFirstChild(targetName)
+    local _, _, enemyHumanoid, enemyRootPart = resolveEnemyParts(enemyEntity)
+    if not enemyHumanoid or enemyHumanoid.Health <= 0 or not enemyRootPart then
+        return false
+    end
+
+    local distance = (enemyRootPart.Position - myRootPart.Position).Magnitude
+    local allowedRange = memory.RangeOverride or Hub.Flags.AutoParryRange
+    if distance > allowedRange + 4 then
+        return false
+    end
+
+    if memory.RequireFacing and not isFacingMe(enemyRootPart, myRootPart) and distance > math.max(7, allowedRange * 0.45) then
+        return false
+    end
+
+    return true, distance
+end
+
+local function scheduleParry(threat)
     local now = os.clock()
-    if now - Hub.Runtime.LastParry < Hub.Flags.AutoParryCooldown then
-        return
-    end
+    local memory = Hub.Runtime.ThreatMemory[threat.TargetName]
 
-    Hub.Runtime.PendingParry = true
-    Hub.Runtime.LastParry = now
-
-    task.spawn(function()
-        local delayTime = Hub.Flags.AutoParryReactionDelay
-        if delayTime > 0 then
-            task.wait(delayTime)
+    if not memory
+        or memory.Signature ~= threat.Signature
+        or now - memory.LastSeen > Hub.Flags.AutoParryThreatReset
+    then
+        local profile = getCustomProfile(threat)
+        local requireFacing = threat.RequireFacing
+        if profile and profile.RequireFacing ~= nil then
+            requireFacing = profile.RequireFacing
         end
 
-        if Hub.Flags.AutoParry and canAct() then
+        memory = {
+            Signature = threat.Signature,
+            Kind = profile and profile.Kind or threat.Kind,
+            Reason = threat.Reason,
+            FirstSeen = now,
+            LastSeen = now,
+            Distance = threat.Distance,
+            Scheduled = false,
+            Consumed = false,
+            RequireFacing = requireFacing,
+            RangeOverride = profile and profile.Range or nil,
+        }
+        Hub.Runtime.ThreatMemory[threat.TargetName] = memory
+        debugPrint("armed threat", threat.TargetName, memory.Kind, threat.Signature, "delay", delayForThreat(threat))
+    else
+        local profile = getCustomProfile(threat)
+        memory.LastSeen = now
+        memory.Distance = threat.Distance
+        if profile and profile.RequireFacing ~= nil then
+            memory.RequireFacing = profile.RequireFacing
+        else
+            memory.RequireFacing = threat.RequireFacing
+        end
+    end
+
+    if memory.Scheduled or memory.Consumed then
+        return
+    end
+
+    if memory.LastAttempt and now - memory.LastAttempt < Hub.Flags.AutoParryMissLockout then
+        return
+    end
+
+    local cooldownRemaining = math.max(0, Hub.Flags.AutoParryCooldown - (now - Hub.Runtime.LastParry))
+    local parryDelay = math.max(delayForThreat(threat), cooldownRemaining)
+    memory.Scheduled = true
+
+    task.spawn(function()
+        task.wait(parryDelay)
+
+        local liveMemory = Hub.Runtime.ThreatMemory[threat.TargetName]
+        if not liveMemory or liveMemory.Signature ~= threat.Signature or liveMemory.Consumed then
+            return
+        end
+
+        liveMemory.Scheduled = false
+        liveMemory.Consumed = true
+        liveMemory.LastAttempt = os.clock()
+
+        if not Hub.Flags.AutoParry or not canAct() then
+            debugPrint("parry skipped", threat.TargetName, threat.Signature, "not actionable")
+            return
+        end
+
+        if os.clock() - Hub.Runtime.LastParry < Hub.Flags.AutoParryCooldown then
+            debugPrint("parry skipped", threat.TargetName, threat.Signature, "global cooldown")
+            return
+        end
+
+        local valid, liveDistance = validateThreat(threat.TargetName, liveMemory)
+        if valid then
+            Hub.Runtime.LastParry = os.clock()
             pressKey(DEFAULT_PARRY_KEY, 0.04)
-            local line = string.format("Auto Parry fired -> %s (%.1f studs, %s)", targetName, distance, reason)
+            local line = string.format(
+                "Auto Parry fired -> %s (%.1f studs, %s)",
+                threat.TargetName,
+                liveDistance or threat.Distance,
+                threat.Reason
+            )
             Hub.Runtime.LastThreat = line
             setStatus(line)
             debugPrint(line)
+        else
+            debugPrint("parry skipped", threat.TargetName, threat.Signature, "threat expired")
         end
-
-        Hub.Runtime.PendingParry = false
     end)
 end
 
@@ -1094,6 +1288,7 @@ function Combat:Stop()
         Hub.Runtime.AutoParryConnection = nil
     end
     Hub.Runtime.PendingParry = false
+    Hub.Runtime.ThreatMemory = {}
 end
 
 function Combat:Start()
@@ -1110,9 +1305,8 @@ function Combat:Start()
             return
         end
 
-        local closestThreat
+        local closestThreat = nil
         local closestDistance = math.huge
-        local closestReason = nil
 
         for _, enemyEntity in ipairs(entities:GetChildren()) do
             if enemyEntity.Name ~= LocalPlayer.Name then
@@ -1120,18 +1314,16 @@ function Combat:Start()
                 if enemyCharacter and enemyHumanoid and enemyHumanoid.Health > 0 and enemyRootPart then
                     local distance = (enemyRootPart.Position - myRootPart.Position).Magnitude
                     if distance <= Hub.Flags.AutoParryRange and distance < closestDistance then
-                        local attacking, reason = isEnemyAttacking(enemyCharacter, enemyEntity)
+                        local threat = isEnemyAttacking(enemyCharacter, enemyEntity)
                         local facing = isFacingMe(enemyRootPart, myRootPart)
                         local closePressure = distance <= math.max(7, Hub.Flags.AutoParryRange * 0.45)
 
-                        if attacking and facing then
-                            closestThreat = enemyEntity.Name
+                        if threat and (facing or closePressure) then
+                            threat.TargetName = enemyEntity.Name
+                            threat.Distance = distance
+                            threat.RequireFacing = not closePressure
+                            closestThreat = threat
                             closestDistance = distance
-                            closestReason = reason or "attack"
-                        elseif attacking and closePressure then
-                            closestThreat = enemyEntity.Name
-                            closestDistance = distance
-                            closestReason = reason or "close attack"
                         end
                     end
                 end
@@ -1139,7 +1331,15 @@ function Combat:Start()
         end
 
         if closestThreat then
-            fireParry(closestReason, closestThreat, closestDistance)
+            scheduleParry(closestThreat)
+        end
+
+        local now = os.clock()
+        for targetName, memory in pairs(Hub.Runtime.ThreatMemory) do
+            if now - memory.LastSeen > Hub.Flags.AutoParryThreatReset then
+                Hub.Runtime.ThreatMemory[targetName] = nil
+                debugPrint("cleared threat", targetName, memory.Signature)
+            end
         end
     end)
 
@@ -1310,11 +1510,51 @@ local function buildInterface()
     })
 
     UI:AddSlider(parrySection, {
-        Text = "Parry Cooldown",
+        Text = "M1 Timing",
+        Flag = "AutoParryM1Delay",
+        Default = Hub.Flags.AutoParryM1Delay,
+        Min = 0.05,
+        Max = 0.45,
+        Increment = 0.01,
+        Suffix = "s",
+    })
+
+    UI:AddSlider(parrySection, {
+        Text = "Heavy Timing",
+        Flag = "AutoParryHeavyDelay",
+        Default = Hub.Flags.AutoParryHeavyDelay,
+        Min = 0.08,
+        Max = 0.7,
+        Increment = 0.01,
+        Suffix = "s",
+    })
+
+    UI:AddSlider(parrySection, {
+        Text = "Skill Timing",
+        Flag = "AutoParrySkillDelay",
+        Default = Hub.Flags.AutoParrySkillDelay,
+        Min = 0.12,
+        Max = 1,
+        Increment = 0.01,
+        Suffix = "s",
+    })
+
+    UI:AddSlider(parrySection, {
+        Text = "Generic Timing",
+        Flag = "AutoParryGenericDelay",
+        Default = Hub.Flags.AutoParryGenericDelay,
+        Min = 0.08,
+        Max = 0.8,
+        Increment = 0.01,
+        Suffix = "s",
+    })
+
+    UI:AddSlider(parrySection, {
+        Text = "Global Cooldown",
         Flag = "AutoParryCooldown",
         Default = Hub.Flags.AutoParryCooldown,
-        Min = 0.1,
-        Max = 1,
+        Min = 0.25,
+        Max = 1.5,
         Increment = 0.05,
         Suffix = "s",
     })
@@ -1330,6 +1570,35 @@ local function buildInterface()
     })
 
     UI:AddSlider(parrySection, {
+        Text = "Ping Compensation",
+        Flag = "AutoParryPingCompensation",
+        Default = Hub.Flags.AutoParryPingCompensation,
+        Min = 0,
+        Max = 1,
+        Increment = 0.05,
+    })
+
+    UI:AddSlider(parrySection, {
+        Text = "Miss Lockout",
+        Flag = "AutoParryMissLockout",
+        Default = Hub.Flags.AutoParryMissLockout,
+        Min = 0.3,
+        Max = 2,
+        Increment = 0.05,
+        Suffix = "s",
+    })
+
+    UI:AddSlider(parrySection, {
+        Text = "Threat Reset",
+        Flag = "AutoParryThreatReset",
+        Default = Hub.Flags.AutoParryThreatReset,
+        Min = 0.35,
+        Max = 2,
+        Increment = 0.05,
+        Suffix = "s",
+    })
+
+    UI:AddSlider(parrySection, {
         Text = "Facing Strictness",
         Flag = "AutoParryFacingDot",
         Default = Hub.Flags.AutoParryFacingDot,
@@ -1338,9 +1607,15 @@ local function buildInterface()
         Increment = 0.05,
     })
 
+    UI:AddToggle(parrySection, {
+        Text = "Skill Timing Assist",
+        Flag = "AutoParrySkillAssist",
+        Default = true,
+    })
+
     local parryInfo = UI:AddSection(combatPage, "Live Readout")
-    UI:AddLabel(parryInfo, "Auto Parry uses enemy entity states, action animations, facing, range, and cooldown.")
-    UI:AddLabel(parryInfo, "Turn on Debug in Utility to print detected states and hostile animations.")
+    UI:AddLabel(parryInfo, "Auto Parry arms each enemy attack once, waits for its timing window, then consumes it.")
+    UI:AddLabel(parryInfo, "Turn on Debug in Utility to record detected states, animations, and skipped parries.")
 
     local moveSection = UI:AddSection(movementPage, "Speed Control")
     UI:AddToggle(moveSection, {
@@ -1445,7 +1720,17 @@ local function buildInterface()
             local entity = getEntityForPlayer(LocalPlayer)
             local _, humanoid = getCharacterParts(LocalPlayer)
             local state = readState(entity)
-            debugPrint("snapshot state=", state, "walkspeed=", humanoid and humanoid.WalkSpeed or "nil", "lastThreat=", Hub.Runtime.LastThreat)
+            local activeThreats = 0
+            for _ in pairs(Hub.Runtime.ThreatMemory) do
+                activeThreats += 1
+            end
+            debugPrint(
+                "snapshot state=", state,
+                "walkspeed=", humanoid and humanoid.WalkSpeed or "nil",
+                "ping=", string.format("%.0fms", getPingSeconds() * 1000),
+                "activeThreats=", activeThreats,
+                "lastThreat=", Hub.Runtime.LastThreat
+            )
             setStatus("Snapshot printed to console.")
         end,
     })
