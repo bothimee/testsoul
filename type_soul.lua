@@ -57,9 +57,7 @@ local AssetService = game:GetService("AssetService")
 
 local localPlayer = Players.LocalPlayer
 local autoParryConnection
-local legitWalkspeedStateConnection
-local legitWalkspeedBaseConnection
-local flashstepConnection
+local movementConnection
 local selectedPlaceId
 local subplaceDropdown
 local lastParryTime = 0
@@ -142,6 +140,73 @@ local function pressKey(keyCode)
     end
 end
 
+local function getDesiredWalkspeed()
+    local _, _, _ = getCharacterParts(localPlayer)
+    local myEntity = getEntityForPlayer(localPlayer)
+    if not myEntity then
+        return nil
+    end
+
+    local currentState = myEntity:GetAttribute("CurrentState")
+    local baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
+
+    if library.flags.Flashstep_Speed and currentState == "Flashstep" then
+        return library.flags.Flashstep_Slider or 100
+    end
+
+    if library.flags.Walkspeed_Legit then
+        if currentState == "Sprinting" then
+            return library.flags.Sprint_Walkspeed or 25
+        end
+
+        if currentState == "WeaponDrawn" then
+            return library.flags.Weapon_Walkspeed or 20
+        end
+
+        if not blockedMovementStates[currentState] then
+            return baseWalkspeed
+        end
+    end
+
+    return nil
+end
+
+local function stopMovementLoop()
+    if movementConnection then
+        movementConnection:Disconnect()
+        movementConnection = nil
+    end
+end
+
+local function startMovementLoop()
+    stopMovementLoop()
+
+    movementConnection = RunService.Heartbeat:Connect(function()
+        if not library.flags.Walkspeed_Legit and not library.flags.Flashstep_Speed then
+            return
+        end
+
+        local _, humanoid = getCharacterParts(localPlayer)
+        local myEntity = getEntityForPlayer(localPlayer)
+        if not humanoid or not myEntity then
+            return
+        end
+
+        local desiredSpeed = getDesiredWalkspeed()
+        if not desiredSpeed then
+            return
+        end
+
+        humanoid.WalkSpeed = desiredSpeed
+
+        pcall(function()
+            if myEntity:GetAttribute("BaseWalkspeed") ~= desiredSpeed and myEntity:GetAttribute("CurrentState") ~= "Flashstep" then
+                myEntity:SetAttribute("BaseWalkspeed", desiredSpeed)
+            end
+        end)
+    end)
+end
+
 local function isEnemyAttacking(enemyCharacter, enemyEntity)
     if enemyEntity and attackStateLookup[enemyEntity:GetAttribute("CurrentState")] then
         return true
@@ -165,6 +230,16 @@ local function isEnemyAttacking(enemyCharacter, enemyEntity)
     end
 
     return false
+end
+
+local function isThreatening(enemyRootPart, myRootPart)
+    local toMe = (myRootPart.Position - enemyRootPart.Position)
+    if toMe.Magnitude == 0 then
+        return false
+    end
+
+    local facingDot = enemyRootPart.CFrame.LookVector:Dot(toMe.Unit)
+    return facingDot > 0.35
 end
 
 local function stopAutoParry()
@@ -219,7 +294,10 @@ local function startAutoParry()
 
                 if enemyCharacter and enemyHumanoid and enemyHumanoid.Health > 0 and enemyRootPart then
                     local distance = (enemyRootPart.Position - myRootPart.Position).Magnitude
-                    if distance <= range and isEnemyAttacking(enemyCharacter, enemyEntity) then
+                    local attacking = isEnemyAttacking(enemyCharacter, enemyEntity)
+                    local threatening = distance <= math.max(7, range * 0.45) and isThreatening(enemyRootPart, myRootPart)
+
+                    if distance <= range and (attacking or threatening) then
                         lastParryTime = os.clock()
                         pressKey(DEFAULT_PARRY_KEY)
                         break
@@ -231,70 +309,17 @@ local function startAutoParry()
 end
 
 local function stopLegitWalkspeed()
-    if legitWalkspeedStateConnection then
-        legitWalkspeedStateConnection:Disconnect()
-        legitWalkspeedStateConnection = nil
-    end
-
-    if legitWalkspeedBaseConnection then
-        legitWalkspeedBaseConnection:Disconnect()
-        legitWalkspeedBaseConnection = nil
+    if not library.flags.Flashstep_Speed then
+        stopMovementLoop()
     end
 end
 
 local function setupLegitWalkspeed()
-    stopLegitWalkspeed()
-
-    local _, humanoid = getCharacterParts(localPlayer)
-    local myEntity = getEntityForPlayer(localPlayer)
-    if not humanoid or not myEntity then
-        return
-    end
-
-    local baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
-
-    local function updateWalkSpeed()
-        if not library.flags.Walkspeed_Legit then
-            humanoid.WalkSpeed = baseWalkspeed
-            return
-        end
-
-        local currentState = myEntity:GetAttribute("CurrentState")
-        if currentState == "Sprinting" then
-            humanoid.WalkSpeed = library.flags.Sprint_Walkspeed or 25
-        elseif currentState == "WeaponDrawn" then
-            humanoid.WalkSpeed = library.flags.Weapon_Walkspeed or 20
-        elseif not blockedMovementStates[currentState] then
-            humanoid.WalkSpeed = baseWalkspeed
-        end
-    end
-
-    legitWalkspeedBaseConnection = myEntity:GetAttributeChangedSignal("BaseWalkspeed"):Connect(function()
-        baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
-        updateWalkSpeed()
-    end)
-
-    legitWalkspeedStateConnection = myEntity:GetAttributeChangedSignal("CurrentState"):Connect(updateWalkSpeed)
-    updateWalkSpeed()
+    startMovementLoop()
 end
 
 local function setupFlashstep()
-    if flashstepConnection then
-        flashstepConnection:Disconnect()
-        flashstepConnection = nil
-    end
-
-    local _, humanoid = getCharacterParts(localPlayer)
-    local myEntity = getEntityForPlayer(localPlayer)
-    if not humanoid or not myEntity then
-        return
-    end
-
-    flashstepConnection = myEntity:GetAttributeChangedSignal("CurrentState"):Connect(function()
-        if library.flags.Flashstep_Speed and myEntity:GetAttribute("CurrentState") == "Flashstep" then
-            humanoid.WalkSpeed = library.flags.Flashstep_Slider or 100
-        end
-    end)
+    startMovementLoop()
 end
 
 local function refreshSubplaces()
@@ -385,14 +410,14 @@ sections.CombatMain:AddSlider({
 
 sections.CombatInfo:AddText({
     enabled = true,
-    text = "Auto Parry uses the normal Type Soul parry key: F",
+    text = "Auto Parry runs from the toggle and sliders only",
     flag = "Combat_Info_Parry",
     risky = false,
 })
 
 sections.CombatInfo:AddText({
     enabled = true,
-    text = "No bind menu needed here, just toggle it on and tune range/cooldown",
+    text = "Range controls detection distance, cooldown controls how often it retries",
     flag = "Combat_Info_Tuning",
     risky = false,
 })
@@ -424,7 +449,7 @@ sections.MovementMain:AddSlider({
     risky = false,
     callback = function()
         if library.flags.Walkspeed_Legit then
-            setupLegitWalkspeed()
+            startMovementLoop()
         end
     end
 })
@@ -441,7 +466,7 @@ sections.MovementMain:AddSlider({
     risky = false,
     callback = function()
         if library.flags.Walkspeed_Legit then
-            setupLegitWalkspeed()
+            startMovementLoop()
         end
     end
 })
@@ -455,6 +480,8 @@ sections.MovementMain:AddToggle({
     callback = function(enabled)
         if enabled then
             setupFlashstep()
+        elseif not library.flags.Walkspeed_Legit then
+            stopMovementLoop()
         end
     end
 })
@@ -471,7 +498,7 @@ sections.MovementMain:AddSlider({
     risky = false,
     callback = function()
         if library.flags.Flashstep_Speed then
-            setupFlashstep()
+            startMovementLoop()
         end
     end
 })
@@ -560,10 +587,8 @@ sections.UtilityInfo:AddText({
 
 localPlayer.CharacterAdded:Connect(function()
     task.wait(1)
-    setupFlashstep()
-
-    if library.flags.Walkspeed_Legit then
-        setupLegitWalkspeed()
+    if library.flags.Walkspeed_Legit or library.flags.Flashstep_Speed then
+        startMovementLoop()
     end
 
     if library.flags.Auto_Parry then
@@ -571,5 +596,4 @@ localPlayer.CharacterAdded:Connect(function()
     end
 end)
 
-setupFlashstep()
 notify("catboy hub", "Type Soul loaded", 5)
