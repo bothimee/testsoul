@@ -1,12 +1,14 @@
-
 getgenv().Config = {
     Invite = "discord.gg/Bg2afYsD",
-    Version = "0.0",
+    Version = "0.1",
 }
 
 getgenv().luaguardvars = {
     DiscordName = "cashfears",
 }
+
+local SOURCE_URL = "https://raw.githubusercontent.com/bothimee/testsoul/main/source.lua"
+local DEFAULT_PARRY_KEY = Enum.KeyCode.F
 
 local function showLoadError(message)
     warn("[catboy hub] " .. tostring(message))
@@ -21,7 +23,7 @@ local function showLoadError(message)
 end
 
 local ok, libraryOrError = pcall(function()
-    local sourceCode = game:HttpGet("https://raw.githubusercontent.com/bothimee/testsoul/main/source.lua")
+    local sourceCode = game:HttpGet(SOURCE_URL)
     local chunk = loadstring(sourceCode)
 
     if not chunk then
@@ -47,29 +49,19 @@ if not ok then
 end
 
 local library = libraryOrError
-
-local Window = library.NewWindow({
-    title = "catboy hub :3",
-    size = UDim2.new(0, 525, 0, 650)
-})
-
-local tabs = {
-    Tab1 = Window:AddTab("Tab1"),
-    Settings = library:CreateSettingsTab(Window),
-}
-
-local sections = {
-    Section1 = tabs.Tab1:AddSection("Section1", 1),
-    Section2 = tabs.Tab1:AddSection("Section2", 2),
-}
-
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local TeleportService = game:GetService("TeleportService")
+local AssetService = game:GetService("AssetService")
 
 local localPlayer = Players.LocalPlayer
 local autoParryConnection
-local autoParryCharacterConnection
+local legitWalkspeedStateConnection
+local legitWalkspeedBaseConnection
+local flashstepConnection
+local selectedPlaceId
+local subplaceDropdown
 local lastParryTime = 0
 
 local attackStateLookup = {
@@ -77,7 +69,6 @@ local attackStateLookup = {
     Skill = true,
     ShikaiSkill = true,
     BankaiSkill = true,
-    WeaponDrawn = false,
 }
 
 local attackAnimationKeywords = {
@@ -94,11 +85,24 @@ local attackAnimationKeywords = {
     "skill",
 }
 
-local unsafeLocalStates = {
+local blockedMovementStates = {
+    Flashstep = true,
     PostureBroken = true,
     TrueStunned = true,
-    Flashstep = true,
+    Skill = true,
+    ShikaiSkill = true,
+    Action = true,
 }
+
+local function notify(title, text, duration)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = title,
+            Text = text,
+            Duration = duration or 5
+        })
+    end)
+end
 
 local function getCharacterParts(player)
     local character = player.Character
@@ -108,7 +112,6 @@ local function getCharacterParts(player)
 
     local humanoid = character:FindFirstChildOfClass("Humanoid")
     local rootPart = character:FindFirstChild("HumanoidRootPart")
-
     if not humanoid or not rootPart then
         return nil
     end
@@ -125,124 +128,43 @@ local function getEntityForPlayer(player)
     return entities:FindFirstChild(player.Name)
 end
 
+local function pressKey(keyCode)
+    local sent = pcall(function()
+        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+        task.wait(0.03)
+        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+    end)
+
+    if not sent and keypress and keyrelease then
+        keypress(keyCode.Value)
+        task.wait(0.03)
+        keyrelease(keyCode.Value)
+    end
+end
+
 local function isEnemyAttacking(enemyCharacter, enemyEntity)
-    if enemyEntity then
-        local currentState = enemyEntity:GetAttribute("CurrentState")
-        if attackStateLookup[currentState] then
-            return true
-        end
+    if enemyEntity and attackStateLookup[enemyEntity:GetAttribute("CurrentState")] then
+        return true
     end
 
     local humanoid = enemyCharacter and enemyCharacter:FindFirstChildOfClass("Humanoid")
-    if not humanoid then
-        return false
-    end
-
-    local animator = humanoid:FindFirstChildOfClass("Animator")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
     if not animator then
         return false
     end
 
     for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        local name = string.lower(track.Name or "")
-        local animation = track.Animation
-        local animationId = animation and string.lower(animation.AnimationId or "") or ""
+        local animationName = string.lower(track.Name or "")
+        local animationId = string.lower((track.Animation and track.Animation.AnimationId) or "")
 
         for _, keyword in ipairs(attackAnimationKeywords) do
-            if string.find(name, keyword, 1, true) or string.find(animationId, keyword, 1, true) then
+            if string.find(animationName, keyword, 1, true) or string.find(animationId, keyword, 1, true) then
                 return true
             end
         end
     end
 
     return false
-end
-
-local function pressParryKey(keyCode)
-    if not keyCode then
-        return
-    end
-
-    local success = pcall(function()
-        VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
-        task.wait(0.03)
-        VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
-    end)
-
-    if not success then
-        if keypress and keyrelease then
-            keypress(keyCode.Value)
-            task.wait(0.03)
-            keyrelease(keyCode.Value)
-        end
-    end
-end
-
-local function shouldAutoParry()
-    if not library.flags["Auto_Parry"] then
-        return false
-    end
-
-    local _, humanoid = getCharacterParts(localPlayer)
-    if not humanoid or humanoid.Health <= 0 then
-        return false
-    end
-
-    local myEntity = getEntityForPlayer(localPlayer)
-    if myEntity then
-        local currentState = myEntity:GetAttribute("CurrentState")
-        if unsafeLocalStates[currentState] then
-            return false
-        end
-    end
-
-    return true
-end
-
-local function startAutoParry()
-    if autoParryConnection then
-        autoParryConnection:Disconnect()
-    end
-
-    autoParryConnection = RunService.Heartbeat:Connect(function()
-        if not shouldAutoParry() then
-            return
-        end
-
-        local _, _, myRootPart = getCharacterParts(localPlayer)
-        if not myRootPart then
-            return
-        end
-
-        local entities = workspace:FindFirstChild("Entities")
-        if not entities then
-            return
-        end
-
-        local range = library.flags["Auto_Parry_Range"] or 18
-        local cooldown = library.flags["Auto_Parry_Cooldown"] or 0.35
-
-        if os.clock() - lastParryTime < cooldown then
-            return
-        end
-
-        for _, enemyEntity in ipairs(entities:GetChildren()) do
-            if enemyEntity.Name ~= localPlayer.Name then
-                local enemyPlayer = Players:FindFirstChild(enemyEntity.Name)
-                if enemyPlayer then
-                    local enemyCharacter, enemyHumanoid, enemyRootPart = getCharacterParts(enemyPlayer)
-                    if enemyCharacter and enemyHumanoid and enemyHumanoid.Health > 0 and enemyRootPart then
-                        local distance = (enemyRootPart.Position - myRootPart.Position).Magnitude
-                        if distance <= range and isEnemyAttacking(enemyCharacter, enemyEntity) then
-                            lastParryTime = os.clock()
-                            pressParryKey(library.flags["Auto_Parry_Bind"] or Enum.KeyCode.F)
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end)
 end
 
 local function stopAutoParry()
@@ -252,159 +174,179 @@ local function stopAutoParry()
     end
 end
 
-autoParryCharacterConnection = localPlayer.CharacterAdded:Connect(function()
-    if library.flags["Auto_Parry"] then
-        task.wait(1)
-        startAutoParry()
+local function canAutoParry()
+    if not library.flags.Auto_Parry then
+        return false
     end
-end)
 
-sections.Section1:AddToggle({
-    enabled = true,
-    text = "Toggle1",
-    flag = "Toggle_1",
-    tooltip = "Tooltip1",
-    risky = true,
-    callback = function(lol)
-        print("Toggle Is Now Set To : ".. tostring(lol))
+    local _, humanoid = getCharacterParts(localPlayer)
+    if not humanoid or humanoid.Health <= 0 then
+        return false
     end
-})
 
-sections.Section1:AddToggle({
-    enabled = true,
-    text = "Walkspeed Legit",
-    flag = "Walkspeed_Legit",
-    tooltip = "Makes your sprinting and weapon walkspeed faster xd not blatant",
-    risky = false,
-    callback = function(lol)
-        local plr = game.Players.LocalPlayer
-        local conn
-        local respawnConn
+    local myEntity = getEntityForPlayer(localPlayer)
+    if not myEntity then
+        return false
+    end
 
-        local function setup()
-            local char = plr.Character or plr.CharacterAdded:Wait()
-            local humanoid = char:WaitForChild("Humanoid")
-            local entities = workspace:WaitForChild("Entities")
-            local myEntity = entities:WaitForChild(plr.Name)
+    return not blockedMovementStates[myEntity:GetAttribute("CurrentState")]
+end
 
-            local baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
+local function startAutoParry()
+    stopAutoParry()
 
-            myEntity:GetAttributeChangedSignal("BaseWalkspeed"):Connect(function()
-                baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
-            end)
+    autoParryConnection = RunService.Heartbeat:Connect(function()
+        if not canAutoParry() then
+            return
+        end
 
-            local function updateWalkSpeed()
-                local state = myEntity:GetAttribute("CurrentState")
-                if state == "Flashstep" then
-                    print("Flashstep → No WalkSpeed change")
-                    return
-                elseif state == "Skill" then
-                    print("Skill → No WalkSpeed change")
-                    return
-                elseif state == "PostureBroken" then
-                    print("PostureBroken → No WalkSpeed change")
-                    return
-                elseif state == "TrueStunned" then
-                    print("TrueStunned → No WalkSpeed change")
-                    return
-                elseif state == "ShikaiSkill" then
-                    print("ShikaiSkill → No WalkSpeed change")
-                    return
-                elseif state == "Action" then
-                    print("Action → No WalkSpeed change")
-                    return
-                elseif state == "Sprinting" then
-                    humanoid.WalkSpeed = 25
-                    print("Sprinting → WalkSpeed = 25")
-                elseif state == "WeaponDrawn" then
-                    humanoid.WalkSpeed = 20
-                    print("WeaponDrawn → WalkSpeed = 20")
-                else
-                    humanoid.WalkSpeed = baseWalkspeed
-                    print("Reset → WalkSpeed = " .. baseWalkspeed .. " (State: " .. tostring(state) .. ")")
+        local _, _, myRootPart = getCharacterParts(localPlayer)
+        local entities = workspace:FindFirstChild("Entities")
+        if not myRootPart or not entities then
+            return
+        end
+
+        local range = library.flags.Auto_Parry_Range or 18
+        local cooldown = library.flags.Auto_Parry_Cooldown or 0.35
+        if os.clock() - lastParryTime < cooldown then
+            return
+        end
+
+        for _, enemyEntity in ipairs(entities:GetChildren()) do
+            if enemyEntity.Name ~= localPlayer.Name then
+                local enemyPlayer = Players:FindFirstChild(enemyEntity.Name)
+                local enemyCharacter, enemyHumanoid, enemyRootPart = enemyPlayer and getCharacterParts(enemyPlayer) or nil
+
+                if enemyCharacter and enemyHumanoid and enemyHumanoid.Health > 0 and enemyRootPart then
+                    local distance = (enemyRootPart.Position - myRootPart.Position).Magnitude
+                    if distance <= range and isEnemyAttacking(enemyCharacter, enemyEntity) then
+                        lastParryTime = os.clock()
+                        pressKey(DEFAULT_PARRY_KEY)
+                        break
+                    end
                 end
-            end
-
-            conn = myEntity:GetAttributeChangedSignal("CurrentState"):Connect(updateWalkSpeed)
-            updateWalkSpeed()
-        end
-
-        if lol then
-            setup()
-            respawnConn = plr.CharacterAdded:Connect(function()
-                task.wait(1)
-                setup()
-            end)
-        else
-            if conn then conn:Disconnect() end
-            if respawnConn then respawnConn:Disconnect() end
-            warn("Walkspeed Legit toggled OFF.")
-        end
-    end
-})
-
-local flashstepConn
-local plr = game.Players.LocalPlayer
-
-local function setupFlashstep()
-    if flashstepConn then flashstepConn:Disconnect() end
-    local char = plr.Character or plr.CharacterAdded:Wait()
-    local humanoid = char:WaitForChild("Humanoid")
-    local myEntity = workspace:WaitForChild("Entities"):WaitForChild(plr.Name)
-
-    flashstepConn = myEntity:GetAttributeChangedSignal("CurrentState"):Connect(function()
-        if library.flags["Flashstep_Speed"] then
-            local state = myEntity:GetAttribute("CurrentState")
-            if state == "Flashstep" then
-                local speed = library.flags["Flashstep_Slider"] or 100
-                humanoid.WalkSpeed = speed
             end
         end
     end)
 end
 
--- Set up on load
-setupFlashstep()
--- Set up on respawn
-plr.CharacterAdded:Connect(function()
-    task.wait(1)
-    setupFlashstep()
-end)
-
--- UI
-sections.Section1:AddToggle({
-    enabled = true,
-    text = "Flashstep Speed",
-    flag = "Flashstep_Speed",
-    tooltip = "Enables Flashstep Speed Control",
-    risky = true,
-    callback = function() end
-})
-
-sections.Section1:AddSlider({
-    text = "Flashstep Speed Slider",
-    flag = "Flashstep_Slider",
-    suffix = "",
-    value = 100,
-    min = 50,
-    max = 300,
-    increment = 1,
-    tooltip = "Set WalkSpeed during Flashstep",
-    risky = false,
-    callback = function(v)
-        print("Flashstep speed set to:", v)
+local function stopLegitWalkspeed()
+    if legitWalkspeedStateConnection then
+        legitWalkspeedStateConnection:Disconnect()
+        legitWalkspeedStateConnection = nil
     end
+
+    if legitWalkspeedBaseConnection then
+        legitWalkspeedBaseConnection:Disconnect()
+        legitWalkspeedBaseConnection = nil
+    end
+end
+
+local function setupLegitWalkspeed()
+    stopLegitWalkspeed()
+
+    local _, humanoid = getCharacterParts(localPlayer)
+    local myEntity = getEntityForPlayer(localPlayer)
+    if not humanoid or not myEntity then
+        return
+    end
+
+    local baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
+
+    local function updateWalkSpeed()
+        if not library.flags.Walkspeed_Legit then
+            humanoid.WalkSpeed = baseWalkspeed
+            return
+        end
+
+        local currentState = myEntity:GetAttribute("CurrentState")
+        if currentState == "Sprinting" then
+            humanoid.WalkSpeed = library.flags.Sprint_Walkspeed or 25
+        elseif currentState == "WeaponDrawn" then
+            humanoid.WalkSpeed = library.flags.Weapon_Walkspeed or 20
+        elseif not blockedMovementStates[currentState] then
+            humanoid.WalkSpeed = baseWalkspeed
+        end
+    end
+
+    legitWalkspeedBaseConnection = myEntity:GetAttributeChangedSignal("BaseWalkspeed"):Connect(function()
+        baseWalkspeed = myEntity:GetAttribute("BaseWalkspeed") or 16
+        updateWalkSpeed()
+    end)
+
+    legitWalkspeedStateConnection = myEntity:GetAttributeChangedSignal("CurrentState"):Connect(updateWalkSpeed)
+    updateWalkSpeed()
+end
+
+local function setupFlashstep()
+    if flashstepConnection then
+        flashstepConnection:Disconnect()
+        flashstepConnection = nil
+    end
+
+    local _, humanoid = getCharacterParts(localPlayer)
+    local myEntity = getEntityForPlayer(localPlayer)
+    if not humanoid or not myEntity then
+        return
+    end
+
+    flashstepConnection = myEntity:GetAttributeChangedSignal("CurrentState"):Connect(function()
+        if library.flags.Flashstep_Speed and myEntity:GetAttribute("CurrentState") == "Flashstep" then
+            humanoid.WalkSpeed = library.flags.Flashstep_Slider or 100
+        end
+    end)
+end
+
+local function refreshSubplaces()
+    local places = {}
+    local pages = AssetService:GetGamePlacesAsync()
+
+    while true do
+        for _, place in pairs(pages:GetCurrentPage()) do
+            table.insert(places, place.Name .. " (ID: " .. place.PlaceId .. ")")
+        end
+
+        if pages.IsFinished then
+            break
+        end
+
+        pages:AdvanceToNextPageAsync()
+    end
+
+    table.sort(places)
+    selectedPlaceId = nil
+    library.flags.Place_Dropdown = nil
+    if subplaceDropdown then
+        subplaceDropdown:SetOptions(places)
+    end
+end
+
+local Window = library.NewWindow({
+    title = "catboy hub : type soul",
+    size = UDim2.new(0, 525, 0, 650)
 })
 
-sections.Section1:AddSeparator({
-    text = "Combat"
-})
+local tabs = {
+    Combat = Window:AddTab("Combat"),
+    Movement = Window:AddTab("Movement"),
+    Utility = Window:AddTab("Utility"),
+    Settings = library:CreateSettingsTab(Window),
+}
 
-sections.Section1:AddToggle({
+local sections = {
+    CombatMain = tabs.Combat:AddSection("Defense", 1),
+    CombatInfo = tabs.Combat:AddSection("Info", 2),
+    MovementMain = tabs.Movement:AddSection("Mobility", 1),
+    MovementInfo = tabs.Movement:AddSection("Notes", 2),
+    UtilityMain = tabs.Utility:AddSection("Travel", 1),
+    UtilityInfo = tabs.Utility:AddSection("Misc", 2),
+}
+
+sections.CombatMain:AddToggle({
     enabled = false,
     text = "Auto Parry",
     flag = "Auto_Parry",
-    tooltip = "Attempts to parry nearby enemy swings automatically",
+    tooltip = "Auto taps parry when a nearby enemy attacks",
     risky = true,
     callback = function(enabled)
         if enabled then
@@ -415,217 +357,219 @@ sections.Section1:AddToggle({
     end
 })
 
-sections.Section1:AddSlider({
-    text = "Auto Parry Range",
+sections.CombatMain:AddSlider({
+    text = "Parry Range",
     flag = "Auto_Parry_Range",
     suffix = " studs",
     value = 18,
     min = 6,
     max = 35,
     increment = 1,
-    tooltip = "How close an enemy must be before auto parry can trigger",
+    tooltip = "How close an enemy must be before auto parry triggers",
     risky = false,
-    callback = function(v)
-        print("Auto parry range set to:", v)
-    end
+    callback = function() end
 })
 
-sections.Section1:AddSlider({
-    text = "Auto Parry Cooldown",
+sections.CombatMain:AddSlider({
+    text = "Parry Cooldown",
     flag = "Auto_Parry_Cooldown",
     suffix = "s",
     value = 0.35,
     min = 0.1,
     max = 1,
     increment = 0.05,
-    tooltip = "Minimum delay between auto parry attempts",
+    tooltip = "Minimum time between parries",
     risky = false,
-    callback = function(v)
-        print("Auto parry cooldown set to:", v)
-    end
-})
-
-sections.Section1:AddBind({
-    text = "Auto Parry Key",
-    flag = "Auto_Parry_Bind",
-    nomouse = true,
-    noindicator = true,
-    tooltip = "Key the script will tap when it detects an incoming attack",
-    mode = "hold",
-    bind = Enum.KeyCode.F,
-    risky = false,
-    keycallback = function()
-        print("Auto parry key changed")
-    end
-})
-
-
-sections.Section1:AddButton({
-    enabled = true,
-    text = "Button1",
-    flag = "Button_1",
-    tooltip = "Tooltip1",
-    risky = false,
-    confirm = false,
-    callback = function(v)
-        print(v)
-    end
-})
-
-sections.Section1:AddSeparator({
-    text = "Misc"
-})
-
-local selectedPlaceId = nil
-
-sections.Section1:AddButton({
-    enabled = true,
-    text = "Fetch Subplaces",
-    flag = "Fetch_Subplaces",
-    tooltip = "Get subplaces of this game",
-    risky = false,
-    confirm = false,
-    callback = function()
-        local places = {}
-        local pages = game:GetService("AssetService"):GetGamePlacesAsync()
-        while true do
-            for _, place in pairs(pages:GetCurrentPage()) do
-                table.insert(places, place.Name .. " (ID: " .. place.PlaceId .. ")")
-            end
-            if pages.IsFinished then break end
-            pages:AdvanceToNextPageAsync()
-        end
-        library.flags.Place_Dropdown = nil -- reset selection
-        dropdown:SetOptions(places)
-    end
-})
-
-local dropdown = sections.Section1:AddList({
-    text = "Select Subplace",
-    flag = "Place_Dropdown",
-    tooltip = "Choose a subplace to teleport to",
-    values = {},
-    callback = function(v)
-        selectedPlaceId = v:match("ID: (%d+)")
-    end
-})
-
-sections.Section1:AddButton({
-    enabled = true,
-    text = "Teleport to Subplace",
-    flag = "Teleport_Subplace",
-    tooltip = "Teleport to selected subplace",
-    risky = false,
-    confirm = false,
-    callback = function()
-        if selectedPlaceId then
-            game:GetService("TeleportService"):Teleport(tonumber(selectedPlaceId), game.Players.LocalPlayer)
-        else
-            warn("No subplace selected!")
-        end
-    end
-})
-
-sections.Section1:AddButton({
-    enabled = true,
-    text = "Full Mode Bar [TSBG]",
-    flag = "Mode_Bar",
-    tooltip = "gives you full mode bar [TSBG ONLY]",
-    risky = false,
-    confirm = false,
-    callback = function(v)
-        local part = workspace:FindFirstChild("Heal Bankai Bar")
-        if part then
-            local clickDetector = part:FindFirstChildOfClass("ClickDetector")
-            if clickDetector then
-                fireclickdetector(clickDetector)
-                print("Clicked Heal Bankai Bar.")
-            else
-                warn("No ClickDetector found in Heal Bankai Bar.")
-            end
-        else
-            warn("Heal Bankai Bar not found in Workspace.")
-        end
-    end
-})
-
-sections.Section1:AddSeparator({ text = "Test" })
-
-sections.Section1:AddSlider({
-    text = "Slider", 
-    flag = 'Slider_1', 
-    suffix = "", 
-    value = 0.000,
-    min = 0.1, 
-    max = 0.999,
-    increment = 0.001,
-    tooltip = "Tooltip1",
-    risky = false,
-    callback = function(v) 
-        print("Slider Value Is Now : ".. v)
-    end
-})
-
-sections.Section1:AddBind({
-    text = "Keybind",
-    flag = "Key_1",
-    nomouse = true,
-    noindicator = true,
-    tooltip = "Tooltip1",
-    mode = "toggle",
-    bind = Enum.KeyCode.Q,
-    risky = false,
-    keycallback = function(v)
-        print("Keybind Changed!")
-    end
-})
-
-sections.Section1:AddList({
-    enabled = true,
-    text = "List",
-    flag = "List_1",
-    multi = false,
-    tooltip = "Tooltip1",
-    risky = false,
-    dragging = false,
-    focused = false,
-    value = "1",
-    values = {
-        "1", "2", "3"
-    },
-    callback = function(v)
-        print("List Value Is Now : "..v)
-    end
-})
-
-sections.Section1:AddBox({
-    enabled = true,
-    focused = true,
-    text = "TextBox1",
-    input = "PlaceHolder1",
-    flag = "Text_1",
-    risky = false,
-    callback = function(v)
-        print(v)
-    end
-})
-
-sections.Section1:AddText({
-    enabled = true,
-    text = "Text1",
-    flag = "Text_1",
-    risky = false,
-})
-
-sections.Section1:AddColor({
-    enabled = true,
-    text = "ColorPicker1",
-    flag = "Color_1",
-    tooltip = "ToolTip1",
-    color = Color3.new(255, 255, 255),
-    trans = 0,
-    open = false,
     callback = function() end
 })
 
-library:SendNotification("Notification", 5, Color3.new(255, 0, 0))
+sections.CombatInfo:AddText({
+    enabled = true,
+    text = "Auto Parry uses the normal Type Soul parry key: F",
+    flag = "Combat_Info_Parry",
+    risky = false,
+})
+
+sections.CombatInfo:AddText({
+    enabled = true,
+    text = "No bind menu needed here, just toggle it on and tune range/cooldown",
+    flag = "Combat_Info_Tuning",
+    risky = false,
+})
+
+sections.MovementMain:AddToggle({
+    enabled = false,
+    text = "Legit Walkspeed",
+    flag = "Walkspeed_Legit",
+    tooltip = "Boosts sprint and weapon drawn speeds only",
+    risky = false,
+    callback = function(enabled)
+        if enabled then
+            setupLegitWalkspeed()
+        else
+            stopLegitWalkspeed()
+        end
+    end
+})
+
+sections.MovementMain:AddSlider({
+    text = "Sprint Speed",
+    flag = "Sprint_Walkspeed",
+    suffix = "",
+    value = 25,
+    min = 16,
+    max = 40,
+    increment = 1,
+    tooltip = "WalkSpeed while sprinting",
+    risky = false,
+    callback = function()
+        if library.flags.Walkspeed_Legit then
+            setupLegitWalkspeed()
+        end
+    end
+})
+
+sections.MovementMain:AddSlider({
+    text = "Weapon Speed",
+    flag = "Weapon_Walkspeed",
+    suffix = "",
+    value = 20,
+    min = 16,
+    max = 32,
+    increment = 1,
+    tooltip = "WalkSpeed while weapon is drawn",
+    risky = false,
+    callback = function()
+        if library.flags.Walkspeed_Legit then
+            setupLegitWalkspeed()
+        end
+    end
+})
+
+sections.MovementMain:AddToggle({
+    enabled = false,
+    text = "Flashstep Speed",
+    flag = "Flashstep_Speed",
+    tooltip = "Overrides WalkSpeed only during Flashstep",
+    risky = true,
+    callback = function(enabled)
+        if enabled then
+            setupFlashstep()
+        end
+    end
+})
+
+sections.MovementMain:AddSlider({
+    text = "Flashstep Speed",
+    flag = "Flashstep_Slider",
+    suffix = "",
+    value = 100,
+    min = 50,
+    max = 300,
+    increment = 1,
+    tooltip = "WalkSpeed while Flashstep is active",
+    risky = false,
+    callback = function()
+        if library.flags.Flashstep_Speed then
+            setupFlashstep()
+        end
+    end
+})
+
+sections.MovementInfo:AddText({
+    enabled = true,
+    text = "Movement edits react to Type Soul entity states instead of forcing speed nonstop",
+    flag = "Movement_Info_States",
+    risky = false,
+})
+
+sections.MovementInfo:AddText({
+    enabled = true,
+    text = "If the game swaps states oddly after death, respawn once and the hooks reattach",
+    flag = "Movement_Info_Respawn",
+    risky = false,
+})
+
+sections.UtilityMain:AddButton({
+    enabled = true,
+    text = "Refresh Subplaces",
+    flag = "Fetch_Subplaces",
+    tooltip = "Fetches all subplaces for this game",
+    risky = false,
+    confirm = false,
+    callback = refreshSubplaces
+})
+
+subplaceDropdown = sections.UtilityMain:AddList({
+    text = "Subplace",
+    flag = "Place_Dropdown",
+    tooltip = "Select a subplace to teleport to",
+    values = {},
+    callback = function(value)
+        selectedPlaceId = value and value:match("ID: (%d+)") or nil
+    end
+})
+
+sections.UtilityMain:AddButton({
+    enabled = true,
+    text = "Teleport To Subplace",
+    flag = "Teleport_Subplace",
+    tooltip = "Teleports you to the selected subplace",
+    risky = false,
+    confirm = false,
+    callback = function()
+        if not selectedPlaceId then
+            warn("No subplace selected.")
+            return
+        end
+
+        TeleportService:Teleport(tonumber(selectedPlaceId), localPlayer)
+    end
+})
+
+sections.UtilityInfo:AddButton({
+    enabled = true,
+    text = "Fill TSBG Mode Bar",
+    flag = "Mode_Bar",
+    tooltip = "Clicks the Heal Bankai Bar if it exists",
+    risky = false,
+    confirm = false,
+    callback = function()
+        local part = workspace:FindFirstChild("Heal Bankai Bar")
+        if not part then
+            warn("Heal Bankai Bar not found.")
+            return
+        end
+
+        local clickDetector = part:FindFirstChildOfClass("ClickDetector")
+        if not clickDetector then
+            warn("No ClickDetector found in Heal Bankai Bar.")
+            return
+        end
+
+        fireclickdetector(clickDetector)
+    end
+})
+
+sections.UtilityInfo:AddText({
+    enabled = true,
+    text = "Random placeholder binds and junk controls have been removed",
+    flag = "Utility_Info_Clean",
+    risky = false,
+})
+
+localPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    setupFlashstep()
+
+    if library.flags.Walkspeed_Legit then
+        setupLegitWalkspeed()
+    end
+
+    if library.flags.Auto_Parry then
+        startAutoParry()
+    end
+end)
+
+setupFlashstep()
+notify("catboy hub", "Type Soul loaded", 5)
