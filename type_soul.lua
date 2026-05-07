@@ -8,8 +8,45 @@ getgenv().luaguardvars = {
     DiscordName = "cashfears",
 }
 
-local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/bothimee/testsoul/main/source.lua"))()
-library:init()
+local function showLoadError(message)
+    warn("[catboy hub] " .. tostring(message))
+
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "catboy hub load failed",
+            Text = tostring(message),
+            Duration = 10
+        })
+    end)
+end
+
+local ok, libraryOrError = pcall(function()
+    local sourceCode = game:HttpGet("https://raw.githubusercontent.com/bothimee/testsoul/main/source.lua")
+    local chunk = loadstring(sourceCode)
+
+    if not chunk then
+        error("loadstring returned nil for source.lua")
+    end
+
+    local loadedLibrary = chunk()
+    if type(loadedLibrary) ~= "table" then
+        error("source.lua did not return a library table")
+    end
+
+    if not Drawing or not Drawing.new then
+        error("executor is missing Drawing support")
+    end
+
+    loadedLibrary:init()
+    return loadedLibrary
+end)
+
+if not ok then
+    showLoadError(libraryOrError)
+    return
+end
+
+local library = libraryOrError
 
 local Window = library.NewWindow({
     title = "catboy hub :3",

@@ -23,6 +23,13 @@ end
 -- // Variables
 local players, http, runservice, inputservice, tweenService, stats, actionservice = gs('Players'), gs('HttpService'), gs('RunService'), gs('UserInputService'), gs('TweenService'), gs('Stats'), gs('ContextActionService')
 local localplayer = players.LocalPlayer
+local makefolder = makefolder or function() end
+local isfile = isfile or function() return false end
+local readfile = readfile or function() return nil end
+local writefile = writefile or function() end
+local listfiles = listfiles or function() return {} end
+local delfile = delfile or function() end
+local setclipboard = setclipboard or function() end
 
 local setByConfig = false
 local floor, ceil, huge, pi, clamp = math.floor, math.ceil, math.huge, math.pi, math.clamp
