@@ -73,7 +73,7 @@ local library = {
         ['colortrans'] = 'https://raw.githubusercontent.com/portallol/luna/main/modules/trans.png';
     };
     numberStrings = {['Zero'] = 0, ['One'] = 1, ['Two'] = 2, ['Three'] = 3, ['Four'] = 4, ['Five'] = 5, ['Six'] = 6, ['Seven'] = 7, ['Eight'] = 8, ['Nine'] = 9};
-    signal = loadstring(game:HttpGet('https://raw.githubusercontent.com/drillygzzly/Other/main/1414'))();
+    signal = nil;
     open = false;
     opening = false;
     hasInit = false;
@@ -81,6 +81,48 @@ local library = {
     gamename = startupArgs.gamename or 'universal';
     fileext = startupArgs.fileext or '.txt';
 }
+
+library.signal = {}
+
+function library.signal.new()
+    local listeners = {}
+    local signal = {}
+
+    function signal:Connect(callback)
+        local connection = {
+            Connected = true
+        }
+
+        function connection:Disconnect()
+            if not self.Connected then
+                return
+            end
+
+            self.Connected = false
+            listeners[self] = nil
+        end
+
+        listeners[connection] = callback
+        return connection
+    end
+
+    function signal:Fire(...)
+        for connection, callback in next, listeners do
+            if connection.Connected then
+                task.spawn(callback, ...)
+            end
+        end
+    end
+
+    function signal:Destroy()
+        for connection in next, listeners do
+            connection.Connected = false
+            listeners[connection] = nil
+        end
+    end
+
+    return signal
+end
 
 library.themes = {
     {
